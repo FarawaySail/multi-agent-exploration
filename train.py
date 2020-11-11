@@ -17,7 +17,7 @@ def main():
     gym.envs.register(id=args.env_name, entry_point=MAMazeEnv, max_episode_steps=200)
     envs = make_parallel_env(args)
     obs = envs.reset()
-    obs,_,_,_ = envs.step([[0,1] for i in range(args.n_rollout_threads)])
+    obs, reward, done, infos = envs.step([[0,1] for i in range(args.n_rollout_threads)])
     import pdb; pdb.set_trace()
 
 if __name__ == "__main__":

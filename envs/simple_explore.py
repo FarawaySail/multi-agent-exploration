@@ -17,9 +17,8 @@ from abc import abstractmethod
 
 from collections import namedtuple
 from envs.env_wrappers import SimplifySubprocVecEnv
-
+import cv2
 #x = random_shape_maze(width=50, height=50, max_shapes=50, max_size=8, allow_overlap=False, shape=None)
-#env_id = 'RandomShapeMaze-v0'
 
 class Maze(BaseMaze):
     @property
@@ -36,7 +35,7 @@ class Maze(BaseMaze):
 class MAMaze(ABC):
     def __init__(self, agent_num):
         self.agent_num = agent_num
-        self.env = random_shape_maze(width=50, height=50, max_shapes=50, max_size=8, allow_overlap=False, shape=None)
+        self.env = random_shape_maze(width=60, height=60, max_shapes=60, max_size=10, allow_overlap=False, shape=None)
         objects = self.make_objects()
         assert all([isinstance(obj, Object) for obj in objects])
         self.objects = namedtuple('Objects', map(lambda x: x.name, objects), defaults=objects)()
@@ -85,29 +84,6 @@ class MAMaze(ABC):
     
     def __repr__(self):
         return f'{self.__class__.__name__}{self.size}'
-'''
-class MAMaze(BaseMaze):
-    def __init__(self, agent_num):
-        super().__init__()
-        self.agent_num = agent_num
-        self.env = random_shape_maze(width=50, height=50, max_shapes=50, max_size=8, allow_overlap=True, shape=None)
-        objects = self.make_objects(self.agent_num)
-        assert all([isinstance(obj, Object) for obj in objects])
-        self.objects = namedtuple('Objects', map(lambda x: x.name, objects), defaults=objects)()
-        
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    @property
-    def size(self):
-        return self.env.shape
-    
-    def make_objects(self,agent_num):
-        free = Object('free', 0, color.free, False, np.stack(np.where(self.env == 0), axis=1))
-        obstacle = Object('obstacle', 1, color.obstacle, True, np.stack(np.where(self.env == 1), axis=1))
-        agent = Object('agent', 2, color.agent, False, [])
-        return free, obstacle, agent
-'''
 
 class MAMazeEnv(BaseEnv):
     def __init__(self, agent_num):
@@ -115,57 +91,48 @@ class MAMazeEnv(BaseEnv):
         
         self.agent_num = agent_num
         self.maze = MAMaze(self.agent_num)
+        self.gt_global_map = self.maze.to_value()
         self.motions = VonNeumannMotion()
         
         self.observation_space = Box(low=0, high=len(self.maze.objects), shape=self.maze.size, dtype=np.uint8)
         self.action_space = Discrete(len(self.motions))
-    '''
-    def step(self, action):
-        motion = self.motions[action]
-        current_position = self.maze.objects.agent.positions[0]
-        new_position = [current_position[0] + motion[0], current_position[1] + motion[1]]
-        valid = self._is_valid(new_position)
-        if valid:
-            self.maze.objects.agent.positions = [new_position]
-        
-        if self._is_goal(new_position):
-            reward = +1
-            done = True
-        elif not valid:
-            reward = -1
-            done = False
-        else:
-            reward = -0.01
-            done = False
-        return self.maze.to_value(), reward, done, {}
-    '''
+
+        self.global_map_size = 60
+        self.local_map_size = 11
+
+        self.global_map = np.full((self.global_map_size, self.global_map_size),-1)
+
+        self.step_n = 5
+
+        self.episode_length = 5
+
 
     def step(self, action):
+        self.timestep += 1
+        info = {}
         for i in range(self.agent_num):
             motion = self.motions[action[i]]
-            current_position = self.maze.objects.agents.positions[i]
-            new_position = [current_position[0] + motion[0], current_position[1] + motion[1]]
-            valid = self._is_valid(new_position)
-            if valid:
-                self.maze.objects.agents.positions[i] = np.asarray(new_position)
-        '''
-        if self._is_goal(new_position):
-            reward = +1
-            done = True
-        elif not valid:
-            reward = -1
-            done = False
-        else:
-            reward = -0.01
-            done = False
-        '''
-        reward = 0
-        done = False
-        return self.maze.to_value(), reward, done, {}
+            for j in range(self.step_n):
+                current_position = self.maze.objects.agents.positions[i]
+                new_position = [current_position[0] + motion[0], current_position[1] + motion[1]]
+                valid = self._is_valid(new_position)
+                if valid:
+                    self.maze.objects.agents.positions[i] = np.asarray(new_position)
+        self.gt_global_map = self.maze.to_value()
+        obs = self.observation()
+        reward = self.reward()
+        done = self.episode_done()
+        info['timestep'] = self.timestep
+        return obs, reward, done, info
 
     def reset(self):
+        self.timestep = 0
         self.maze = MAMaze(self.agent_num)
-        return self.maze.to_value()
+        self.gt_global_map = self.maze.to_value()
+        self.global_map = np.full((self.global_map_size, self.global_map_size),-1)
+        obs = self.observation()
+        self.prev_explored_area = self.global_map.shape[0]**2-(self.global_map==-1).sum()
+        return obs
     
     def _is_valid(self, position):
         nonnegative = position[0] >= 0 and position[1] >= 0
@@ -184,18 +151,43 @@ class MAMazeEnv(BaseEnv):
     def get_image(self):
         return self.maze.to_rgb()
 
-    #def observation(self):
+    def observation(self):
+        local_maps = []
+        global_maps = []
+        for i in range(self.agent_num):        
+            local_map = np.zeros((self.local_map_size, self.local_map_size))
+            #fp_explored = np.zeros((self.args.local_map_size, self.args.local_map_size))
+            current_pos = self.maze.objects.agents.positions[i]
+            local_map = self.gt_global_map[(current_pos[0]-self.local_map_size // 2):(current_pos[0]+self.local_map_size//2+1), (current_pos[1]-self.local_map_size // 2):(current_pos[1]+self.local_map_size//2+1)]
+            self.global_map[(current_pos[0]-self.local_map_size // 2):(current_pos[0]+self.local_map_size//2+1), (current_pos[1]-self.local_map_size // 2):(current_pos[1]+self.local_map_size//2+1)] = local_map
+            local_maps.append(local_map)
+        for i in range(self.agent_num): 
+            global_maps.append(self.global_map)
+        return local_maps, global_maps
+
+    def reward(self):
+        curr_explored_area = self.global_map.shape[0]**2-(self.global_map==-1).sum()
+        reward = curr_explored_area - self.prev_explored_area
+        self.prev_explored_area = curr_explored_area
+        return reward
+
+    def episode_done(self):
+        if self.timestep >= self.episode_length:
+            return True
+        if self.prev_explored_area == self.global_map.shape[0]**2:
+            return True
+        return False
+
 
 if __name__ == "__main__":
-
+    env_id = 'RandomShapeMaze-v0'
     gym.envs.register(id=env_id, entry_point=MAMazeEnv, max_episode_steps=200)
 
     env = gym.make(env_id, agent_num=2)
     obs = env.reset()
-    print(obs[20:30, 20:30])
-    img = env.render('rgb_array')
-    obs, _, _, _ = env.step([1, 0])
-    print(obs[20:30, 20:30])
+    #print(obs[20:30, 20:30])
+    #img = env.render('rgb_array')
+    obs, reward, done, _ = env.step([1, 0])
     import pdb; pdb.set_trace()
     plt.imshow(img)
     plt.show()
